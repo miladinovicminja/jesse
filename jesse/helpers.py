@@ -1,741 +1,871 @@
-import hashlib
-import math
-import os
-import random
-import string
+import datetime
+import inspect
+import mimetypes
 import sys
-import uuid
-from typing import List, Tuple, Union, Any
+from os import getcwd
+from tempfile import NamedTemporaryFile
+from typing import Any, Callable, Dict, List, Type
 
-import arrow
-import click
-import numpy as np
+import pandas as pd
+import streamlit as st
+from fastapi.encoders import jsonable_encoder
+from loguru import logger
+from pydantic import BaseModel, ValidationError, parse_obj_as
 
-CACHED_CONFIG = dict()
+from opyrator import Opyrator
+from opyrator.core import name_to_title
+from opyrator.ui import schema_utils, streamlit_utils
+from opyrator.ui.streamlit_utils import CUSTOM_STREAMLIT_CSS, SessionState
 
+STREAMLIT_RUNNER_SNIPPET = """
+from opyrator.ui import render_streamlit_ui
+from opyrator import Opyrator
 
-def app_currency() -> str:
-    from jesse.routes import router
-    return quote_asset(router.routes[0].symbol)
+import streamlit as st
 
+st.set_page_config(page_title="Opyrator", page_icon=":arrow_forward:")
 
-def app_mode() -> str:
-    from jesse.config import config
-    return config['app']['trading_mode']
+with st.spinner("Loading Opyrator. Please wait..."):
+    opyrator = Opyrator("{opyrator_path}")
 
+render_streamlit_ui(opyrator)
+"""
 
-def arrow_to_timestamp(arrow_time: arrow.arrow.Arrow) -> int:
-    return arrow_time.int_timestamp * 1000
 
+def launch_ui(opyrator_path: str, port: int = 8501) -> None:
+    # import streamlit.bootstrap as bootstrap
+    # from streamlit.cli import _get_command_line_as_string
+    # print(_get_command_line_as_string())
+    with NamedTemporaryFile(suffix=".py", mode="w", encoding="utf-8") as f:
+        f.write(STREAMLIT_RUNNER_SNIPPET.format(opyrator_path=opyrator_path))
+        f.seek(0)
 
-def base_asset(symbol: str) -> str:
-    return symbol.split('-')[0]
+        # TODO: PYTHONPATH="$PYTHONPATH:/workspace/opyrator/src"
+        import subprocess
 
+        subprocess.run(
+            f'PYTHONPATH="$PYTHONPATH:{getcwd()}" {sys.executable} -m streamlit run --server.port={port} --server.headless=True --runner.magicEnabled=False --server.maxUploadSize=50 --browser.gatherUsageStats=False {f.name}',
+            shell=True,
+        )
 
-def binary_search(arr: list, item) -> int:
-    """
-    performs a simple binary search on a sorted list
 
-    :param arr: list
-    :param item:
-
-    :return: int
-    """
-    from bisect import bisect_left
-
-    i = bisect_left(arr, item)
-    if i != len(arr) and arr[i] == item:
-        return i
-    else:
-        return -1
-
-
-def class_iter(Class):
-    return (value for variable, value in vars(Class).items() if
-            not callable(getattr(Class, variable)) and not variable.startswith("__"))
-
-
-def clean_orderbook_list(arr) -> List[List[float]]:
-    return [[float(i[0]), float(i[1])] for i in arr]
-
-
-def color(msg_text: str, msg_color: str) -> str:
-    if not msg_text:
-        return ''
-
-    if msg_color == 'black':
-        return click.style(msg_text, fg='black')
-    if msg_color == 'red':
-        return click.style(msg_text, fg='red')
-    if msg_color == 'green':
-        return click.style(msg_text, fg='green')
-    if msg_color == 'yellow':
-        return click.style(msg_text, fg='yellow')
-    if msg_color == 'blue':
-        return click.style(msg_text, fg='blue')
-    if msg_color == 'magenta':
-        return click.style(msg_text, fg='magenta')
-    if msg_color == 'cyan':
-        return click.style(msg_text, fg='cyan')
-    if msg_color in ['white', 'gray']:
-        return click.style(msg_text, fg='white')
-
-    raise ValueError('unsupported color')
-
-
-def convert_number(old_max: float, old_min: float, new_max: float, new_min: float, old_value: float) -> float:
-    """
-    convert a number from one range (ex 40-119) to another
-    range (ex 0-30) while keeping the ratio.
-    """
-    # validation
-    if old_value > old_max or old_value < old_min:
-        raise ValueError('old_value:{} must be within the range. {}-{}'.format(old_value, old_min, old_max))
-
-    old_range = (old_max - old_min)
-    new_range = (new_max - new_min)
-    new_value = (((old_value - old_min) * new_range) / old_range) + new_min
-
-    return new_value
-
-
-def dashless_symbol(symbol: str) -> str:
-    return symbol.replace("-", "")
-
-
-def dashy_symbol(symbol: str) -> str:
-    return symbol[0:3] + '-' + symbol[3:]
-
-
-def date_diff_in_days(date1: arrow.arrow.Arrow, date2: arrow.arrow.Arrow) -> int:
-    if type(date1) is not arrow.arrow.Arrow or type(
-            date2) is not arrow.arrow.Arrow:
-        raise TypeError('dates must be Arrow instances')
-
-    dif = date2 - date1
-
-    return abs(dif.days)
-
-
-def date_to_timestamp(date: str) -> int:
-    """
-    converts date string into timestamp. "2015-08-01" => 1438387200000
-
-    :param date: str
-    :return: int
-    """
-    return arrow_to_timestamp(arrow.get(date, 'YYYY-MM-DD'))
-
-
-def dna_to_hp(strategy_hp, dna: str):
-    hp = {}
-
-    for gene, h in zip(dna, strategy_hp):
-        if h['type'] is int:
-            decoded_gene = int(
-                round(
-                    convert_number(119, 40, h['max'], h['min'], ord(gene))
-                )
-            )
-        elif h['type'] is float:
-            decoded_gene = convert_number(119, 40, h['max'], h['min'], ord(gene))
-        else:
-            raise TypeError('Only int and float types are implemented')
-
-        hp[h['name']] = decoded_gene
-    return hp
-
-
-def dump_exception() -> None:
-    """
-    a useful debugging helper
-    """
-    import traceback
-    print(traceback.format_exc())
-    terminate_app()
-
-
-def estimate_average_price(order_qty: float, order_price: float, current_qty: float,
-                           current_entry_price: float) -> float:
-    """Estimates the new entry price for the position.
-    This is used after having a new order and updating the currently holding position.
-
-    Arguments:
-        order_qty {float} -- qty of the new order
-        order_price {float} -- price of the new order
-        current_qty {float} -- current(pre-calculation) qty
-        current_entry_price {float} -- current(pre-calculation) entry price
-
-    Returns:
-        float -- the new/averaged entry price
-    """
-    return (abs(order_qty) * order_price + abs(current_qty) *
-            current_entry_price) / (abs(order_qty) + abs(current_qty))
-
-
-def estimate_PNL(qty: float, entry_price: float, exit_price: float, trade_type: str, trading_fee: float = 0) -> float:
-    qty = abs(qty)
-    profit = qty * (exit_price - entry_price)
-
-    if trade_type == 'short':
-        profit *= -1
-
-    fee = trading_fee * qty * (entry_price + exit_price)
-
-    return profit - fee
-
-
-def estimate_PNL_percentage(qty: float, entry_price: float, exit_price: float, trade_type: str) -> float:
-    qty = abs(qty)
-    profit = qty * (exit_price - entry_price)
-
-    if trade_type == 'short':
-        profit *= -1
-
-    return (profit / (qty * entry_price)) * 100
-
-
-def file_exists(path: str) -> bool:
-    return os.path.isfile(path)
-
-
-def floor_with_precision(num: float, precision: int = 0) -> float:
-    temp = 10 ** precision
-    return math.floor(num * temp) / temp
-
-
-def format_currency(num: float) -> str:
-    return f'{num:,}'
-
-
-def generate_unique_id() -> str:
-    return str(uuid.uuid4())
-
-
-def get_arrow(timestamp: int) -> arrow.arrow.Arrow:
-    return timestamp_to_arrow(timestamp)
-
-
-def get_candle_source(candles: np.ndarray, source_type: str = "close") -> np.ndarray:
-    """
-     Returns the candles corresponding the selected type.
-
-     :param candles: np.ndarray
-     :param source_type: string
-     :return: np.ndarray
-     """
-
-    if source_type == "close":
-        return candles[:, 2]
-    elif source_type == "high":
-        return candles[:, 3]
-    elif source_type == "low":
-        return candles[:, 4]
-    elif source_type == "open":
-        return candles[:, 1]
-    elif source_type == "volume":
-        return candles[:, 5]
-    elif source_type == "hl2":
-        return (candles[:, 3] + candles[:, 4]) / 2
-    elif source_type == "hlc3":
-        return (candles[:, 3] + candles[:, 4] + candles[:, 2]) / 3
-    elif source_type == "ohlc4":
-        return (candles[:, 1] + candles[:, 3] + candles[:, 4] + candles[:, 2]) / 4
-    else:
-        raise ValueError('type string not recognised')
-
-
-def get_config(keys: str, default: Any = None) -> Any:
-    """
-    Gets keys as a single string separated with "." and returns value.
-    Also accepts a default value so that the app would work even if
-    the required config value is missing from config.py file.
-    Example: get_config('env.logging.order_submission', True)
-
-    :param keys: str
-    :param default: None
-    :return:
-    """
-    if not str:
-        raise ValueError('keys string cannot be empty')
-
-    if is_unit_testing() or not keys in CACHED_CONFIG:
-        if os.environ.get(keys.upper().replace(".", "_")) is not None:
-            CACHED_CONFIG[keys] = os.environ.get(keys.upper().replace(".", "_"))
-        else:
-            from functools import reduce
-            from jesse.config import config
-            CACHED_CONFIG[keys] = reduce(lambda d, k: d.get(k, default) if isinstance(d, dict) else default,
-                                         keys.split("."), config)
-
-    return CACHED_CONFIG[keys]
-
-
-def get_strategy_class(strategy_name: str):
-    from pydoc import locate
-
-    if is_unit_testing():
-        return locate('jesse.strategies.{}.{}'.format(strategy_name, strategy_name))
-    else:
-        return locate('strategies.{}.{}'.format(strategy_name, strategy_name))
-
-
-def insecure_hash(msg: str) -> str:
-    return hashlib.md5(msg.encode()).hexdigest()
-
-
-def insert_list(index: int, item, arr: list) -> list:
-    """
-    helper to insert an item in a Python List without removing the item
-    """
-    if index == -1:
-        return arr + [item]
-
-    return arr[:index] + [item] + arr[index:]
-
-
-def is_backtesting() -> bool:
-    from jesse.config import config
-    return config['app']['trading_mode'] == 'backtest'
-
-
-def is_collecting_data() -> bool:
-    from jesse.config import config
-    return config['app']['trading_mode'] == 'collect'
-
-
-def is_debuggable(debug_item) -> bool:
-    from jesse.config import config
-    return is_debugging() and config['env']['logging'][debug_item]
-
-
-def is_debugging() -> bool:
-    from jesse.config import config
-    return config['app']['debug_mode']
-
-
-def is_importing_candles() -> bool:
-    from jesse.config import config
-    return config['app']['trading_mode'] == 'import-candles'
-
-
-def is_live() -> bool:
-    return is_livetrading() or is_paper_trading()
-
-
-def is_livetrading() -> bool:
-    from jesse.config import config
-    return config['app']['trading_mode'] == 'livetrade'
-
-
-def is_optimizing() -> bool:
-    from jesse.config import config
-    return config['app']['trading_mode'] == 'optimize'
-
-
-def is_paper_trading() -> bool:
-    from jesse.config import config
-    return config['app']['trading_mode'] == 'papertrade'
-
-
-def is_test_driving() -> bool:
-    from jesse.config import config
-    return config['app']['is_test_driving']
-
-
-def is_unit_testing() -> bool:
-    return "pytest" in sys.modules
-
-
-def is_valid_uuid(uuid_to_test, version: int = 4) -> bool:
+def function_has_named_arg(func: Callable, parameter: str) -> bool:
     try:
-        uuid_obj = uuid.UUID(uuid_to_test, version=version)
-    except ValueError:
+        sig = inspect.signature(func)
+        for param in sig.parameters.values():
+            if param.name == "input":
+                return True
+    except Exception:
         return False
-    return str(uuid_obj) == uuid_to_test
-
-
-def key(exchange: str, symbol: str, timeframe: str = None):
-    if timeframe is None:
-        return '{}-{}'.format(exchange, symbol)
-
-    return '{}-{}-{}'.format(exchange, symbol, timeframe)
-
-
-def max_timeframe(timeframes_list: list) -> str:
-    from jesse.enums import timeframes
-
-    if timeframes.WEEK_1 in timeframes_list:
-        return timeframes.WEEK_1
-    if timeframes.DAY_3 in timeframes_list:
-        return timeframes.DAY_3
-    if timeframes.DAY_1 in timeframes_list:
-        return timeframes.DAY_1
-    if timeframes.HOUR_12 in timeframes_list:
-        return timeframes.HOUR_12
-    if timeframes.HOUR_8 in timeframes_list:
-        return timeframes.HOUR_8
-    if timeframes.HOUR_6 in timeframes_list:
-        return timeframes.HOUR_6
-    if timeframes.HOUR_4 in timeframes_list:
-        return timeframes.HOUR_4
-    if timeframes.HOUR_3 in timeframes_list:
-        return timeframes.HOUR_3
-    if timeframes.HOUR_2 in timeframes_list:
-        return timeframes.HOUR_2
-    if timeframes.HOUR_1 in timeframes_list:
-        return timeframes.HOUR_1
-    if timeframes.MINUTE_45 in timeframes_list:
-        return timeframes.MINUTE_45
-    if timeframes.MINUTE_30 in timeframes_list:
-        return timeframes.MINUTE_30
-    if timeframes.MINUTE_15 in timeframes_list:
-        return timeframes.MINUTE_15
-    if timeframes.MINUTE_5 in timeframes_list:
-        return timeframes.MINUTE_5
-    if timeframes.MINUTE_3 in timeframes_list:
-        return timeframes.MINUTE_3
-
-    return timeframes.MINUTE_1
-
-
-def normalize(x: float, x_min: float, x_max: float) -> float:
-    """
-    Rescaling data to have values between 0 and 1
-    """
-    x_new = (x - x_min) / (x_max - x_min)
-    return x_new
-
-
-def now() -> int:
-    return now_to_timestamp()
-
-
-def now_to_timestamp() -> int:
-    if not (is_live() or is_collecting_data() or is_importing_candles()):
-        from jesse.store import store
-        return store.app.time
-
-    return arrow.utcnow().int_timestamp * 1000
-
-
-def np_ffill(arr: np.ndarray, axis: int = 0) -> np.ndarray:
-    idx_shape = tuple([slice(None)] + [np.newaxis] * (len(arr.shape) - axis - 1))
-    idx = np.where(~np.isnan(arr), np.arange(arr.shape[axis])[idx_shape], 0)
-    np.maximum.accumulate(idx, axis=axis, out=idx)
-    slc = [np.arange(k)[tuple([slice(None) if dim == i else np.newaxis
-                               for dim in range(len(arr.shape))])]
-           for i, k in enumerate(arr.shape)]
-    slc[axis] = idx
-    return arr[tuple(slc)]
-
-
-def np_shift(arr: np.ndarray, num: int, fill_value=0) -> np.ndarray:
-    result = np.empty_like(arr)
-
-    if num > 0:
-        result[:num] = fill_value
-        result[num:] = arr[:-num]
-    elif num < 0:
-        result[num:] = fill_value
-        result[:num] = arr[-num:]
-    else:
-        result[:] = arr
-
-    return result
-
-
-def opposite_side(s: str) -> str:
-    from jesse.enums import sides
-
-    if s == sides.BUY:
-        return sides.SELL
-    if s == sides.SELL:
-        return sides.BUY
-    raise ValueError('unsupported side')
-
-
-def opposite_type(t: str) -> str:
-    from jesse.enums import trade_types
-
-    if t == trade_types.LONG:
-        return trade_types.SHORT
-    if t == trade_types.SHORT:
-        return trade_types.LONG
-    raise ValueError('unsupported type')
-
-
-def orderbook_insertion_index_search(arr, target: int, ascending: bool = True) -> Tuple[bool, int]:
-    target = target[0]
-    lower = 0
-    upper = len(arr)
-
-    if ascending:
-        while lower < upper:
-            x = lower + (upper - lower) // 2
-            val = arr[x][0]
-            if target == val:
-                return True, x
-            elif target > val:
-                if lower == x:
-                    return False, lower + 1
-                lower = x
-            elif target < val:
-                if lower == x:
-                    return False, lower
-                upper = x
-    else:
-        while lower < upper:
-            x = lower + (upper - lower) // 2
-            val = arr[x][0]
-            if target == val:
-                return True, x
-            elif target < val:
-                if lower == x:
-                    return False, lower + 1
-                lower = x
-            elif target > val:
-                if lower == x:
-                    return False, lower
-                upper = x
-
-
-def orderbook_trim_price(p: float, ascending: bool, unit: float) -> float:
-    if ascending:
-        trimmed = np.ceil(p / unit) * unit
-        if math.log10(unit) < 0:
-            trimmed = round(trimmed, abs(int(math.log10(unit))))
-        return p if trimmed == p + unit else trimmed
-
-    trimmed = np.ceil(p / unit) * unit - unit
-    if math.log10(unit) < 0:
-        trimmed = round(trimmed, abs(int(math.log10(unit))))
-    return p if trimmed == p - unit else trimmed
-
-
-def prepare_qty(qty: float, side: str) -> float:
-    if side.lower() in ('sell', 'short'):
-        return -abs(qty)
-
-    if side.lower() in ('buy', 'long'):
-        return abs(qty)
-
-    raise TypeError()
-
-
-def python_version() -> float:
-    return float('{}.{}'.format(sys.version_info[0], sys.version_info[1]))
-
-
-def quote_asset(symbol: str) -> str:
-    try:
-        return symbol.split('-')[1]
-    except IndexError:
-        from jesse.exceptions import InvalidRoutes
-        raise InvalidRoutes("The symbol format is incorrect. Correct example: 'BTC-USDT'. Yours is '{}'".format(symbol))
-
-
-def random_str(num_characters: int = 8) -> str:
-    return ''.join(random.choice(string.ascii_letters) for i in range(num_characters))
-
-
-def readable_duration(seconds: int, granularity: int = 2) -> str:
-    intervals = (
-        ('weeks', 604800),  # 60 * 60 * 24 * 7
-        ('days', 86400),  # 60 * 60 * 24
-        ('hours', 3600),  # 60 * 60
-        ('minutes', 60),
-        ('seconds', 1),
-    )
-
-    result = []
-    seconds = int(seconds)
-
-    for name, count in intervals:
-        value = seconds // count
-        if value:
-            seconds -= value * count
-            if value == 1:
-                name = name.rstrip('s')
-            result.append("{} {}".format(value, name))
-    return ', '.join(result[:granularity])
-
-
-def relative_to_absolute(path: str) -> str:
-    return os.path.abspath(path)
-
-
-def round_price_for_live_mode(price: float, roundable_price: float) -> Union[float, np.ndarray]:
-    """
-    Rounds price(s) based on exchange requirements
-
-    :param price: float
-    :param roundable_price: float
-    :return: float | nd.array
-    """
-    n = int(math.log10(price))
-
-    if price < 1:
-        price_round_precision = abs(n - 4)
-    else:
-        price_round_precision = 3 - n
-        if price_round_precision < 0:
-            price_round_precision = 0
-
-    return np.round(roundable_price, price_round_precision)
-
-
-def round_qty_for_live_mode(price: float, roundable_qty: float) -> Union[float, np.ndarray]:
-    """
-    Rounds qty(s) based on exchange requirements
-
-    :param price: float
-    :param roundable_qty: float | nd.array
-    :return: float | nd.array
-    """
-    n = int(math.log10(price))
-
-    if price < 1:
-        qty_round_precision = 0
-    else:
-        qty_round_precision = n + 1
-        if qty_round_precision > 3:
-            qty_round_precision = 3
-    rounded = np.round(roundable_qty, qty_round_precision)
-
-    for index, q in enumerate(rounded):
-        if q == 0.0:
-            rounded[index] = 0.001
-
-    return rounded
-
-
-def same_length(bigger: np.ndarray, shorter: np.ndarray) -> np.ndarray:
-    return np.concatenate((np.full((bigger.shape[0] - shorter.shape[0]), np.nan), shorter))
-
-
-def secure_hash(msg: str) -> str:
-    return hashlib.sha256(msg.encode()).hexdigest()
-
-
-def should_execute_silently() -> bool:
-    return is_optimizing() or is_unit_testing()
-
-
-def side_to_type(s: str) -> str:
-    from jesse.enums import trade_types, sides
-
-    if s == sides.BUY:
-        return trade_types.LONG
-    if s == sides.SELL:
-        return trade_types.SHORT
-    raise ValueError
-
-
-def string_after_character(string: str, character: str) -> str:
-    try:
-        return string.split(character, 1)[1]
-    except IndexError:
+    return False
+
+
+def has_output_ui_renderer(data_item: BaseModel) -> bool:
+    return hasattr(data_item, "render_output_ui")
+
+
+def has_input_ui_renderer(input_class: Type[BaseModel]) -> bool:
+    return hasattr(input_class, "render_input_ui")
+
+
+def is_compatible_audio(mime_type: str) -> bool:
+    return mime_type in ["audio/mpeg", "audio/ogg", "audio/wav"]
+
+
+def is_compatible_image(mime_type: str) -> bool:
+    return mime_type in ["image/png", "image/jpeg"]
+
+
+def is_compatible_video(mime_type: str) -> bool:
+    return mime_type in ["video/mp4"]
+
+
+class InputUI:
+    def __init__(self, session_state: SessionState, input_class: Type[BaseModel]):
+        self._session_state = session_state
+        self._input_class = input_class
+
+        self._schema_properties = input_class.schema(by_alias=True).get(
+            "properties", {}
+        )
+        self._schema_references = input_class.schema(by_alias=True).get(
+            "definitions", {}
+        )
+
+        # TODO: check if state has input data
+
+    def render_ui(self) -> None:
+        if has_input_ui_renderer(self._input_class):
+            # The input model has a rendering function
+            # The rendering also returns the current state of input data
+            self._session_state.input_data = self._input_class.render_input_ui(  # type: ignore
+                st, self._session_state.input_data
+            ).dict()
+            return
+
+        required_properties = self._input_class.schema(by_alias=True).get(
+            "required", []
+        )
+
+        for property_key in self._schema_properties.keys():
+            streamlit_app = st.sidebar
+            property = self._schema_properties[property_key]
+
+            if not property.get("title"):
+                # Set property key as fallback title
+                property["title"] = name_to_title(property_key)
+
+            if property_key in required_properties:
+                streamlit_app = st
+
+            try:
+                self._store_value(
+                    property_key,
+                    self._render_property(streamlit_app, property_key, property),
+                )
+            except Exception:
+                pass
+
+    def _get_default_streamlit_input_kwargs(self, key: str, property: Dict) -> Dict:
+        streamlit_kwargs = {
+            "label": property.get("title"),
+            "key": str(self._session_state.run_id) + "-" + key,
+        }
+
+        if property.get("description"):
+            streamlit_kwargs["help"] = property.get("description")
+        return streamlit_kwargs
+
+    def _store_value(self, key: str, value: Any) -> None:
+        data_element = self._session_state.input_data
+        key_elements = key.split(".")
+        for i, key_element in enumerate(key_elements):
+            if i == len(key_elements) - 1:
+                # add value to this element
+                data_element[key_element] = value
+                return
+            if key_element not in data_element:
+                data_element[key_element] = {}
+            data_element = data_element[key_element]
+
+    def _get_value(self, key: str) -> Any:
+        data_element = self._session_state.input_data
+        key_elements = key.split(".")
+        for i, key_element in enumerate(key_elements):
+            if i == len(key_elements) - 1:
+                # add value to this element
+                if key_element not in data_element:
+                    return None
+                return data_element[key_element]
+            if key_element not in data_element:
+                data_element[key_element] = {}
+            data_element = data_element[key_element]
         return None
 
+    def _render_single_datetime_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        streamlit_kwargs = self._get_default_streamlit_input_kwargs(key, property)
 
-def slice_candles(candles: np.ndarray, sequential: bool) -> np.ndarray:
-    warmup_candles_num = get_config('env.data.warmup_candles_num', 240)
-    if not sequential and len(candles) > warmup_candles_num:
-        candles = candles[-warmup_candles_num:]
-    return candles
+        if property.get("format") == "time":
+            if property.get("default"):
+                try:
+                    streamlit_kwargs["value"] = datetime.time.fromisoformat(  # type: ignore
+                        property.get("default")
+                    )
+                except Exception:
+                    pass
+            return streamlit_app.time_input(**streamlit_kwargs)
+        elif property.get("format") == "date":
+            if property.get("default"):
+                try:
+                    streamlit_kwargs["value"] = datetime.date.fromisoformat(  # type: ignore
+                        property.get("default")
+                    )
+                except Exception:
+                    pass
+            return streamlit_app.date_input(**streamlit_kwargs)
+        elif property.get("format") == "date-time":
+            if property.get("default"):
+                try:
+                    streamlit_kwargs["value"] = datetime.datetime.fromisoformat(  # type: ignore
+                        property.get("default")
+                    )
+                except Exception:
+                    pass
+            with st.beta_container():
+                st.subheader(streamlit_kwargs.get("label"))
+                if streamlit_kwargs.get("description"):
+                    st.text(streamlit_kwargs.get("description"))
+                selected_date = None
+                selected_time = None
+                date_col, time_col = st.beta_columns(2)
+                with date_col:
+                    date_kwargs = {"label": "Date", "key": key + "-date-input"}
+                    if streamlit_kwargs.get("value"):
+                        try:
+                            date_kwargs["value"] = streamlit_kwargs.get(  # type: ignore
+                                "value"
+                            ).date()
+                        except Exception:
+                            pass
+                    selected_date = st.date_input(**date_kwargs)
+
+                with time_col:
+                    time_kwargs = {"label": "Time", "key": key + "-time-input"}
+                    if streamlit_kwargs.get("value"):
+                        try:
+                            time_kwargs["value"] = streamlit_kwargs.get(  # type: ignore
+                                "value"
+                            ).time()
+                        except Exception:
+                            pass
+                    selected_time = st.time_input(**time_kwargs)
+                return datetime.datetime.combine(selected_date, selected_time)
+        else:
+            streamlit_app.warning(
+                "Date format is not supported: " + str(property.get("format"))
+            )
+
+    def _render_single_file_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        streamlit_kwargs = self._get_default_streamlit_input_kwargs(key, property)
+        file_extension = None
+        if "mime_type" in property:
+            file_extension = mimetypes.guess_extension(property["mime_type"])
+
+        uploaded_file = streamlit_app.file_uploader(
+            **streamlit_kwargs, accept_multiple_files=False, type=file_extension
+        )
+        if uploaded_file is None:
+            return None
+
+        bytes = uploaded_file.getvalue()
+        if property.get("mime_type"):
+            if is_compatible_audio(property["mime_type"]):
+                # Show audio
+                streamlit_app.audio(bytes, format=property.get("mime_type"))
+            if is_compatible_image(property["mime_type"]):
+                # Show image
+                streamlit_app.image(bytes)
+            if is_compatible_video(property["mime_type"]):
+                # Show video
+                streamlit_app.video(bytes, format=property.get("mime_type"))
+        return bytes
+
+    def _render_single_string_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        streamlit_kwargs = self._get_default_streamlit_input_kwargs(key, property)
+
+        if property.get("default"):
+            streamlit_kwargs["value"] = property.get("default")
+        elif property.get("example"):
+            # TODO: also use example for other property types
+            # Use example as value if it is provided
+            streamlit_kwargs["value"] = property.get("example")
+
+        if property.get("maxLength") is not None:
+            streamlit_kwargs["max_chars"] = property.get("maxLength")
+
+        if (
+            property.get("format")
+            or (
+                property.get("maxLength") is not None
+                and int(property.get("maxLength")) < 140  # type: ignore
+            )
+            or property.get("writeOnly")
+        ):
+            # If any format is set, use single text input
+            # If max chars is set to less than 140, use single text input
+            # If write only -> password field
+            if property.get("writeOnly"):
+                streamlit_kwargs["type"] = "password"
+            return streamlit_app.text_input(**streamlit_kwargs)
+        else:
+            # Otherwise use multiline text area
+            return streamlit_app.text_area(**streamlit_kwargs)
+
+    def _render_multi_enum_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        streamlit_kwargs = self._get_default_streamlit_input_kwargs(key, property)
+        reference_item = schema_utils.resolve_reference(
+            property["items"]["$ref"], self._schema_references
+        )
+        # TODO: how to select defaults
+        return streamlit_app.multiselect(
+            **streamlit_kwargs, options=reference_item["enum"]
+        )
+
+    def _render_single_enum_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+
+        streamlit_kwargs = self._get_default_streamlit_input_kwargs(key, property)
+        reference_item = schema_utils.get_single_reference_item(
+            property, self._schema_references
+        )
+
+        if property.get("default") is not None:
+            try:
+                streamlit_kwargs["index"] = reference_item["enum"].index(
+                    property.get("default")
+                )
+            except Exception:
+                # Use default selection
+                pass
+
+        return streamlit_app.selectbox(
+            **streamlit_kwargs, options=reference_item["enum"]
+        )
+
+    def _render_single_dict_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+
+        # Add title and subheader
+        streamlit_app.subheader(property.get("title"))
+        if property.get("description"):
+            streamlit_app.markdown(property.get("description"))
+
+        streamlit_app.markdown("---")
+
+        current_dict = self._get_value(key)
+        if not current_dict:
+            current_dict = {}
+
+        key_col, value_col = streamlit_app.beta_columns(2)
+
+        with key_col:
+            updated_key = streamlit_app.text_input(
+                "Key", value="", key=key + "-new-key"
+            )
+
+        with value_col:
+            # TODO: also add boolean?
+            value_kwargs = {"label": "Value", "key": key + "-new-value"}
+            if property["additionalProperties"].get("type") == "integer":
+                value_kwargs["value"] = 0  # type: ignore
+                updated_value = streamlit_app.number_input(**value_kwargs)
+            elif property["additionalProperties"].get("type") == "number":
+                value_kwargs["value"] = 0.0  # type: ignore
+                value_kwargs["format"] = "%f"
+                updated_value = streamlit_app.number_input(**value_kwargs)
+            else:
+                value_kwargs["value"] = ""
+                updated_value = streamlit_app.text_input(**value_kwargs)
+
+        streamlit_app.markdown("---")
+
+        with streamlit_app.beta_container():
+            clear_col, add_col = streamlit_app.beta_columns([1, 2])
+
+            with clear_col:
+                if streamlit_app.button("Clear Items", key=key + "-clear-items"):
+                    current_dict = {}
+
+            with add_col:
+                if (
+                    streamlit_app.button("Add Item", key=key + "-add-item")
+                    and updated_key
+                ):
+                    current_dict[updated_key] = updated_value
+
+        streamlit_app.write(current_dict)
+
+        return current_dict
+
+    def _render_single_reference(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        reference_item = schema_utils.get_single_reference_item(
+            property, self._schema_references
+        )
+        return self._render_property(streamlit_app, key, reference_item)
+
+    def _render_multi_file_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        streamlit_kwargs = self._get_default_streamlit_input_kwargs(key, property)
+
+        file_extension = None
+        if "mime_type" in property:
+            file_extension = mimetypes.guess_extension(property["mime_type"])
+
+        uploaded_files = streamlit_app.file_uploader(
+            **streamlit_kwargs, accept_multiple_files=True, type=file_extension
+        )
+        uploaded_files_bytes = []
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                uploaded_files_bytes.append(uploaded_file.read())
+        return uploaded_files_bytes
+
+    def _render_single_boolean_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        streamlit_kwargs = self._get_default_streamlit_input_kwargs(key, property)
+
+        if property.get("default"):
+            streamlit_kwargs["value"] = property.get("default")
+        return streamlit_app.checkbox(**streamlit_kwargs)
+
+    def _render_single_number_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        streamlit_kwargs = self._get_default_streamlit_input_kwargs(key, property)
+
+        number_transform = int
+        if property.get("type") == "number":
+            number_transform = float  # type: ignore
+            streamlit_kwargs["format"] = "%f"
+
+        if "multipleOf" in property:
+            # Set stepcount based on multiple of parameter
+            streamlit_kwargs["step"] = number_transform(property["multipleOf"])
+        elif number_transform == int:
+            # Set step size to 1 as default
+            streamlit_kwargs["step"] = 1
+        elif number_transform == float:
+            # Set step size to 0.01 as default
+            # TODO: adapt to default value
+            streamlit_kwargs["step"] = 0.01
+
+        if "minimum" in property:
+            streamlit_kwargs["min_value"] = number_transform(property["minimum"])
+        if "exclusiveMinimum" in property:
+            streamlit_kwargs["min_value"] = number_transform(
+                property["exclusiveMinimum"] + streamlit_kwargs["step"]
+            )
+        if "maximum" in property:
+            streamlit_kwargs["max_value"] = number_transform(property["maximum"])
+
+        if "exclusiveMaximum" in property:
+            streamlit_kwargs["max_value"] = number_transform(
+                property["exclusiveMaximum"] - streamlit_kwargs["step"]
+            )
+
+        if property.get("default") is not None:
+            streamlit_kwargs["value"] = number_transform(property.get("default"))  # type: ignore
+        else:
+            if "min_value" in streamlit_kwargs:
+                streamlit_kwargs["value"] = streamlit_kwargs["min_value"]
+            elif number_transform == int:
+                streamlit_kwargs["value"] = 0
+            else:
+                # Set default value to step
+                streamlit_kwargs["value"] = number_transform(streamlit_kwargs["step"])
+
+        if "min_value" in streamlit_kwargs and "max_value" in streamlit_kwargs:
+            # TODO: Only if less than X steps
+            return streamlit_app.slider(**streamlit_kwargs)
+        else:
+            return streamlit_app.number_input(**streamlit_kwargs)
+
+    def _render_object_input(self, streamlit_app: st, key: str, property: Dict) -> Any:
+        properties = property["properties"]
+        object_inputs = {}
+        for property_key in properties:
+            property = properties[property_key]
+            if not property.get("title"):
+                # Set property key as fallback title
+                property["title"] = name_to_title(property_key)
+            # construct full key based on key parts -> required later to get the value
+            full_key = key + "." + property_key
+            object_inputs[property_key] = self._render_property(
+                streamlit_app, full_key, property
+            )
+        return object_inputs
+
+    def _render_single_object_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+        # Add title and subheader
+        title = property.get("title")
+        streamlit_app.subheader(title)
+        if property.get("description"):
+            streamlit_app.markdown(property.get("description"))
+
+        object_reference = schema_utils.get_single_reference_item(
+            property, self._schema_references
+        )
+        return self._render_object_input(streamlit_app, key, object_reference)
+
+    def _render_property_list_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+
+        # Add title and subheader
+        streamlit_app.subheader(property.get("title"))
+        if property.get("description"):
+            streamlit_app.markdown(property.get("description"))
+
+        streamlit_app.markdown("---")
+
+        current_list = self._get_value(key)
+        if not current_list:
+            current_list = []
+
+        value_kwargs = {"label": "Value", "key": key + "-new-value"}
+        if property["items"]["type"] == "integer":
+            value_kwargs["value"] = 0  # type: ignore
+            new_value = streamlit_app.number_input(**value_kwargs)
+        elif property["items"]["type"] == "number":
+            value_kwargs["value"] = 0.0  # type: ignore
+            value_kwargs["format"] = "%f"
+            new_value = streamlit_app.number_input(**value_kwargs)
+        else:
+            value_kwargs["value"] = ""
+            new_value = streamlit_app.text_input(**value_kwargs)
+
+        streamlit_app.markdown("---")
+
+        with streamlit_app.beta_container():
+            clear_col, add_col = streamlit_app.beta_columns([1, 2])
+
+            with clear_col:
+                if streamlit_app.button("Clear Items", key=key + "-clear-items"):
+                    current_list = []
+
+            with add_col:
+                if (
+                    streamlit_app.button("Add Item", key=key + "-add-item")
+                    and new_value is not None
+                ):
+                    current_list.append(new_value)
+
+        streamlit_app.write(current_list)
+
+        return current_list
+
+    def _render_object_list_input(
+        self, streamlit_app: st, key: str, property: Dict
+    ) -> Any:
+
+        # TODO: support max_items, and min_items properties
+
+        # Add title and subheader
+        streamlit_app.subheader(property.get("title"))
+        if property.get("description"):
+            streamlit_app.markdown(property.get("description"))
+
+        streamlit_app.markdown("---")
+
+        current_list = self._get_value(key)
+        if not current_list:
+            current_list = []
+
+        object_reference = schema_utils.resolve_reference(
+            property["items"]["$ref"], self._schema_references
+        )
+        input_data = self._render_object_input(streamlit_app, key, object_reference)
+
+        streamlit_app.markdown("---")
+
+        with streamlit_app.beta_container():
+            clear_col, add_col = streamlit_app.beta_columns([1, 2])
+
+            with clear_col:
+                if streamlit_app.button("Clear Items", key=key + "-clear-items"):
+                    current_list = []
+
+            with add_col:
+                if (
+                    streamlit_app.button("Add Item", key=key + "-add-item")
+                    and input_data
+                ):
+                    current_list.append(input_data)
+
+        streamlit_app.write(current_list)
+        return current_list
+
+    def _render_property(self, streamlit_app: st, key: str, property: Dict) -> Any:
+        if schema_utils.is_single_enum_property(property, self._schema_references):
+            return self._render_single_enum_input(streamlit_app, key, property)
+
+        if schema_utils.is_multi_enum_property(property, self._schema_references):
+            return self._render_multi_enum_input(streamlit_app, key, property)
+
+        if schema_utils.is_single_file_property(property):
+            return self._render_single_file_input(streamlit_app, key, property)
+
+        if schema_utils.is_multi_file_property(property):
+            return self._render_multi_file_input(streamlit_app, key, property)
+
+        if schema_utils.is_single_datetime_property(property):
+            return self._render_single_datetime_input(streamlit_app, key, property)
+
+        if schema_utils.is_single_boolean_property(property):
+            return self._render_single_boolean_input(streamlit_app, key, property)
+
+        if schema_utils.is_single_dict_property(property):
+            return self._render_single_dict_input(streamlit_app, key, property)
+
+        if schema_utils.is_single_number_property(property):
+            return self._render_single_number_input(streamlit_app, key, property)
+
+        if schema_utils.is_single_string_property(property):
+            return self._render_single_string_input(streamlit_app, key, property)
+
+        if schema_utils.is_single_object(property, self._schema_references):
+            return self._render_single_object_input(streamlit_app, key, property)
+
+        if schema_utils.is_object_list_property(property, self._schema_references):
+            return self._render_object_list_input(streamlit_app, key, property)
+
+        if schema_utils.is_property_list(property):
+            return self._render_property_list_input(streamlit_app, key, property)
+
+        if schema_utils.is_single_reference(property):
+            return self._render_single_reference(streamlit_app, key, property)
+
+        streamlit_app.warning(
+            "The type of the following property is currently not supported: "
+            + str(property.get("title"))
+        )
+        raise Exception("Unsupported property")
 
 
-def style(msg_text: str, msg_style: str) -> str:
-    if msg_style is None:
-        return msg_text
+class OutputUI:
+    def __init__(self, output_data: Any, input_data: Any):
+        self._output_data = output_data
+        self._input_data = input_data
 
-    if msg_style.lower() in ['bold', 'b']:
-        return click.style(msg_text, bold=True)
+    def render_ui(self) -> None:
+        try:
+            if isinstance(self._output_data, BaseModel):
+                self._render_single_output(st, self._output_data)
+                return
+            if type(self._output_data) == list:
+                self._render_list_output(st, self._output_data)
+                return
+        except Exception as ex:
+            st.exception(ex)
+            # Fallback to
+            st.json(jsonable_encoder(self._output_data))
 
-    if msg_style.lower() in ['underline', 'u']:
-        return click.style(msg_text, underline=True)
+    def _render_single_text_property(
+        self, streamlit: st, property_schema: Dict, value: Any
+    ) -> None:
+        # Add title and subheader
+        streamlit.subheader(property_schema.get("title"))
+        if property_schema.get("description"):
+            streamlit.markdown(property_schema.get("description"))
+        if value is None or value == "":
+            streamlit.info("No value returned!")
+        else:
+            streamlit.code(str(value), language="plain")
 
-    raise ValueError('unsupported style')
+    def _render_single_file_property(
+        self, streamlit: st, property_schema: Dict, value: Any
+    ) -> None:
+        # Add title and subheader
+        streamlit.subheader(property_schema.get("title"))
+        if property_schema.get("description"):
+            streamlit.markdown(property_schema.get("description"))
+        if value is None or value == "":
+            streamlit.info("No value returned!")
+        else:
+            # TODO: Detect if it is a FileContent instance
+            # TODO: detect if it is base64
+            file_extension = ""
+            if "mime_type" in property_schema:
+                mime_type = property_schema["mime_type"]
+                file_extension = mimetypes.guess_extension(mime_type) or ""
+
+                if is_compatible_audio(mime_type):
+                    streamlit.audio(value.as_bytes(), format=mime_type)
+                    return
+
+                if is_compatible_image(mime_type):
+                    streamlit.image(value.as_bytes())
+                    return
+
+                if is_compatible_video(mime_type):
+                    streamlit.video(value.as_bytes(), format=mime_type)
+                    return
+
+            filename = (
+                (property_schema["title"] + file_extension)
+                .lower()
+                .strip()
+                .replace(" ", "-")
+            )
+            streamlit.markdown(
+                f'<a href="data:application/octet-stream;base64,{value}" download="{filename}"><input type="button" value="Download File"></a>',
+                unsafe_allow_html=True,
+            )
+
+    def _render_single_complex_property(
+        self, streamlit: st, property_schema: Dict, value: Any
+    ) -> None:
+        # Add title and subheader
+        streamlit.subheader(property_schema.get("title"))
+        if property_schema.get("description"):
+            streamlit.markdown(property_schema.get("description"))
+
+        streamlit.json(jsonable_encoder(value))
+
+    def _render_single_output(self, streamlit: st, output_data: BaseModel) -> None:
+        try:
+            if has_output_ui_renderer(output_data):
+                if function_has_named_arg(output_data.render_output_ui, "input"):  # type: ignore
+                    # render method also requests the input data
+                    output_data.render_output_ui(streamlit, input=self._input_data)  # type: ignore
+                else:
+                    output_data.render_output_ui(streamlit)  # type: ignore
+                return
+        except Exception:
+            # Use default auto-generation methods if the custom rendering throws an exception
+            logger.exception(
+                "Failed to execute custom render_output_ui function. Using auto-generation instead"
+            )
+
+        model_schema = output_data.schema(by_alias=False)
+        model_properties = model_schema.get("properties")
+        definitions = model_schema.get("definitions")
+
+        if model_properties:
+            for property_key in output_data.__dict__:
+                property_schema = model_properties.get(property_key)
+                if not property_schema.get("title"):
+                    # Set property key as fallback title
+                    property_schema["title"] = property_key
+
+                output_property_value = output_data.__dict__[property_key]
+
+                if has_output_ui_renderer(output_property_value):
+                    output_property_value.render_output_ui(streamlit)  # type: ignore
+                    continue
+
+                if isinstance(output_property_value, BaseModel):
+                    # Render output recursivly
+                    streamlit.subheader(property_schema.get("title"))
+                    if property_schema.get("description"):
+                        streamlit.markdown(property_schema.get("description"))
+                    self._render_single_output(streamlit, output_property_value)
+                    continue
+
+                if property_schema:
+                    if schema_utils.is_single_file_property(property_schema):
+                        self._render_single_file_property(
+                            streamlit, property_schema, output_property_value
+                        )
+                        continue
+
+                    if (
+                        schema_utils.is_single_string_property(property_schema)
+                        or schema_utils.is_single_number_property(property_schema)
+                        or schema_utils.is_single_datetime_property(property_schema)
+                        or schema_utils.is_single_boolean_property(property_schema)
+                    ):
+                        self._render_single_text_property(
+                            streamlit, property_schema, output_property_value
+                        )
+                        continue
+                    if definitions and schema_utils.is_single_enum_property(
+                        property_schema, definitions
+                    ):
+                        self._render_single_text_property(
+                            streamlit, property_schema, output_property_value.value
+                        )
+                        continue
+
+                    # TODO: render dict as table
+
+                    self._render_single_complex_property(
+                        streamlit, property_schema, output_property_value
+                    )
+            return
+
+        # Display single field in code block:
+        # if len(output_data.__dict__) == 1:
+        #     value = next(iter(output_data.__dict__.values()))
+
+        #     if type(value) in (int, float, str):
+        #         # Should not be a complex object (with __dict__) -> should be a primitive
+        #         # hasattr(output_data.__dict__[0], '__dict__')
+        #         streamlit.subheader("This is a test:")
+        #         streamlit.code(value, language="plain")
+        #         return
+
+        # Fallback to json output
+        streamlit.json(jsonable_encoder(output_data))
+
+    def _render_list_output(self, streamlit: st, output_data: List) -> None:
+        try:
+            data_items: List = []
+            for data_item in output_data:
+                if has_output_ui_renderer(data_item):
+                    # Render using the render function
+                    data_item.render_output_ui(streamlit)  # type: ignore
+                    continue
+                data_items.append(data_item.dict())
+            # Try to show as dataframe
+            streamlit.table(pd.DataFrame(data_items))
+        except Exception:
+            # Fallback to
+            streamlit.json(jsonable_encoder(output_data))
 
 
-def terminate_app() -> None:
-    # close the database
-    from jesse.services.db import close_connection
-    close_connection()
-    # disconnect python from the OS
-    os._exit(1)
+def render_streamlit_ui(opyrator: Opyrator) -> None:
+    session_state = streamlit_utils.get_session_state()
 
+    title = opyrator.name
+    if "opyrator" not in opyrator.name.lower():
+        title += " - Opyrator"
 
-def timeframe_to_one_minutes(timeframe: str) -> int:
-    from jesse.enums import timeframes
-    from jesse.exceptions import InvalidTimeframe
-    all_timeframes = [timeframe for timeframe in class_iter(timeframes)]
+    # Page config can only be setup once
+    # st.set_page_config(page_title="Opyrator", page_icon=":arrow_forward:")
 
-    dic = {
-        timeframes.MINUTE_1: 1,
-        timeframes.MINUTE_3: 3,
-        timeframes.MINUTE_5: 5,
-        timeframes.MINUTE_15: 15,
-        timeframes.MINUTE_30: 30,
-        timeframes.MINUTE_45: 45,
-        timeframes.HOUR_1: 60,
-        timeframes.HOUR_2: 60 * 2,
-        timeframes.HOUR_3: 60 * 3,
-        timeframes.HOUR_4: 60 * 4,
-        timeframes.HOUR_6: 60 * 6,
-        timeframes.HOUR_8: 60 * 8,
-        timeframes.HOUR_12: 60 * 12,
-        timeframes.DAY_1: 60 * 24,
-        timeframes.DAY_3: 60 * 24 * 3,
-        timeframes.WEEK_1: 60 * 24 * 7,
-    }
+    st.title(title)
 
-    try:
-        return dic[timeframe]
-    except KeyError:
-        raise InvalidTimeframe(
-            'Timeframe "{}" is invalid. Supported timeframes are {}.'.format(
-                timeframe, ', '.join(all_timeframes)))
+    # Add custom css settings
+    st.markdown(f"<style>{CUSTOM_STREAMLIT_CSS}</style>", unsafe_allow_html=True)
 
+    if opyrator.description:
+        st.markdown(opyrator.description)
 
-def timestamp_to_arrow(timestamp: int) -> arrow.arrow.Arrow:
-    return arrow.get(timestamp / 1000)
+    InputUI(session_state=session_state, input_class=opyrator.input_type).render_ui()
 
+    st.markdown("---")
 
-def timestamp_to_date(timestamp: int) -> str:
-    return str(arrow.get(timestamp / 1000))[:10]
+    clear_col, execute_col = st.beta_columns([1, 2])
 
+    with clear_col:
+        if st.button("Clear"):
+            # Clear all state
+            session_state.clear()
+            st.experimental_rerun()
 
-def timestamp_to_time(timestamp: int) -> str:
-    return str(arrow.get(timestamp / 1000))
+    with execute_col:
+        execute_selected = st.button("Execute")
 
+    if execute_selected:
+        with st.spinner("Executing operation. Please wait..."):
+            try:
+                input_data_obj = parse_obj_as(
+                    opyrator.input_type, session_state.input_data
+                )
+                session_state.output_data = opyrator(input=input_data_obj)
+                session_state.latest_operation_input = input_data_obj  # should this really be saved as additional session object?
+            except ValidationError as ex:
+                st.error(ex)
+            else:
+                # st.success("Operation executed successfully.")
+                pass
 
-def today_to_timestamp() -> int:
-    """
-    returns today's (beginning) timestamp
+    if session_state.output_data:
+        OutputUI(
+            session_state.output_data, session_state.latest_operation_input
+        ).render_ui()
 
-    :return: int
-    """
-    return arrow.utcnow().floor('day').int_timestamp * 1000
+        st.markdown("---")
 
-
-def type_to_side(t: str) -> str:
-    from jesse.enums import trade_types, sides
-
-    if t == trade_types.LONG:
-        return sides.BUY
-    if t == trade_types.SHORT:
-        return sides.SELL
-    raise ValueError
-
-
-def unique_list(arr) -> list:
-    """
-    returns a unique version of the list while keeping its order
-    :param arr: list | tuple
-    :return: list
-    """
-    seen = set()
-    seen_add = seen.add
-    return [x for x in arr if not (x in seen or seen_add(x))]
+        show_json = st.empty()
+        # with st.beta_expander(label="Show JSON Output", expanded=False):
+        if show_json.button("Show JSON Output"):
+            # Shows json if button is selected
+            show_json.json(session_state.output_data.json())
